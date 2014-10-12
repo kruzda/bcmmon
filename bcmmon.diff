@@ -1,0 +1,285 @@
+diff -rup -N ./ndiswrapper-1.59/driver/iw_ndis.c ./ndiswrapper-1.59_bcmmon/driver/iw_ndis.c
+--- ./ndiswrapper-1.59/driver/iw_ndis.c	2008-05-28 04:54:08.000000000 +0200
++++ ./ndiswrapper-1.59_bcmmon/driver/iw_ndis.c	2008-11-22 17:20:22.000000000 +0100
+@@ -29,6 +29,17 @@
+ #include "iw_ndis.h"
+ #include "wrapndis.h"
+ 
++#define WLC_SET_PROMISC				10
++#define WLC_SET_CHANNEL				30
++#define WLC_SET_PASSIVE_SCAN				49
++#define WLC_DISASSOC					52
++#define WLC_GET_MONITOR				107
++#define WLC_SET_MONITOR				108
++
++extern void *magicaddr;
++extern unsigned char bcmmon;
++extern UINT (*wlc_ioctl)(int *, int, char *, int, void *) wstdcall;
++
+ static int freq_chan[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442,
+ 			   2447, 2452, 2457, 2462, 2467, 2472, 2484 };
+ 
+@@ -176,8 +187,41 @@ static int iw_set_infra_mode(struct net_
+ {
+ 	struct ndis_device *wnd = netdev_priv(dev);
+ 	enum ndis_infrastructure_mode ndis_mode;
++	int val;
+ 
+ 	ENTER2("%d", wrqu->mode);
++	
++	/* Can we do the magic? */
++	if(magicaddr && wlc_ioctl) {
++	    if(wrqu->mode == IW_MODE_MONITOR) {
++		val = 1;
++		LIN2WIN5(wlc_ioctl, magicaddr, WLC_DISASSOC, (char *)&val, sizeof(val), NULL);	    
++		LIN2WIN5(wlc_ioctl, magicaddr, WLC_SET_MONITOR, (char *)&val, sizeof(val), NULL);	    
++		LIN2WIN5(wlc_ioctl, magicaddr, WLC_SET_PROMISC, (char *)&val, sizeof(val), NULL);	    
++	    
++		val = 0;
++		LIN2WIN5(wlc_ioctl, magicaddr, WLC_GET_MONITOR, (char *)&val, sizeof(val), NULL);	    
++
++		if(val == 1) {
++		    dev->type = ARPHRD_IEEE80211_PRISM;
++		    bcmmon = 1;
++		    printk(KERN_INFO "BCMMON: Monitor mode enabled :)\n");
++		}
++		else
++		    printk(KERN_INFO "BCMMON: Setting monitor mode failed\n");
++	    } else {
++		val = 1;
++		LIN2WIN5(wlc_ioctl, magicaddr, WLC_DISASSOC, (char *)&val, sizeof(val), NULL);	    
++		val = 0;
++		LIN2WIN5(wlc_ioctl, magicaddr, WLC_SET_MONITOR, (char *)&val, sizeof(val), NULL);	    
++		LIN2WIN5(wlc_ioctl, magicaddr, WLC_SET_PROMISC, (char *)&val, sizeof(val), NULL);	    
++		dev->type = ARPHRD_ETHER;
++		bcmmon = 0;
++	    }
++	    
++	    EXIT2(return 0);
++	}
++	
+ 	switch (wrqu->mode) {
+ 	case IW_MODE_ADHOC:
+ 		ndis_mode = Ndis802_11IBSS;
+@@ -205,8 +249,20 @@ static int iw_get_infra_mode(struct net_
+ 	struct ndis_device *wnd = netdev_priv(dev);
+ 	int ndis_mode, iw_mode;
+ 	NDIS_STATUS res;
++	int mon = 0;
+ 
+ 	ENTER2("");
++	
++	/* Have we used wlc_ioctl to set mode? */
++	if(magicaddr && wlc_ioctl) {
++	    LIN2WIN5(wlc_ioctl, magicaddr, 107, (char *)&mon, sizeof(mon), NULL);	    
++
++	    if(mon == 1) {
++		wrqu->mode = IW_MODE_MONITOR;
++		EXIT2(return 0);
++	    }
++	}
++	
+ 	res = mp_query_int(wnd, OID_802_11_INFRASTRUCTURE_MODE, &ndis_mode);
+ 	if (res) {
+ 		WARNING("getting operating mode failed (%08X)", res);
+@@ -302,8 +358,10 @@ static int iw_set_freq(struct net_device
+ 	struct ndis_device *wnd = netdev_priv(dev);
+ 	NDIS_STATUS res;
+ 	struct ndis_configuration req;
++	int chan;
+ 
+ 	ENTER2("");
++	
+ 	/* this OID is valid only when not associated */
+ 	if (netif_carrier_ok(wnd->net_dev))
+ 		EXIT2(return 0);
+@@ -316,8 +374,15 @@ static int iw_set_freq(struct net_device
+	}
+ 
+ 	if (wrqu->freq.m < 1000 && wrqu->freq.e == 0) {
+-		if (wrqu->freq.m >= 1 && wrqu->freq.m <= ARRAY_SIZE(freq_chan))
++		if (wrqu->freq.m >= 1 && wrqu->freq.m <= ARRAY_SIZE(freq_chan)) {
+ 			req.ds_config = freq_chan[wrqu->freq.m - 1] * 1000;
++			
++			/* In monitor mode we need to set channel directly */
++			if(magicaddr && wlc_ioctl && bcmmon) {
++			    chan = wrqu->freq.m;
++			    LIN2WIN5(wlc_ioctl, magicaddr, WLC_SET_CHANNEL, (char *)&chan, sizeof(chan), NULL);
++			}
++		}
+ 		else
+ 			return -EINVAL;
+ 	} else {
+@@ -1832,6 +1897,21 @@ static int priv_deauthenticate(struct ne
+ 	return res;
+ }
+ 
++static int priv_passive_scan(struct net_device *dev,
++			      struct iw_request_info *info,
++			      union iwreq_data *wrqu, char *extra)
++{
++	int passive;
++	int ret = -1;
++
++	if(wlc_ioctl && magicaddr) {
++	    passive = wrqu->param.value;
++	    ret = LIN2WIN5(wlc_ioctl, magicaddr, WLC_SET_PASSIVE_SCAN, (char *)&passive, sizeof(passive), NULL);    
++	}
++	
++	return ret;
++}
++
+ static int priv_power_profile(struct net_device *dev,
+ 			      struct iw_request_info *info,
+ 			      union iwreq_data *wrqu, char *extra)
+@@ -1935,8 +2015,9 @@ static const struct iw_priv_args priv_ar
+ 	 "network_type"},
+ 	{PRIV_MEDIA_STREAM_MODE, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0,
+ 	 "media_stream"},
+-
+ 	{PRIV_RELOAD_DEFAULTS, 0, 0, "reload_defaults"},
++	{PRIV_PASSIVE_SCAN, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0,
++	 "passive_scan"}
+ };
+ 
+ #define WEPRIV(id) [id - SIOCIWFIRSTPRIV]
+@@ -1948,6 +2029,7 @@ static const iw_handler priv_handler[] =
+ 	WEPRIV(PRIV_NETWORK_TYPE)	= priv_network_type,
+ 	WEPRIV(PRIV_MEDIA_STREAM_MODE)	= priv_media_stream_mode,
+ 	WEPRIV(PRIV_RELOAD_DEFAULTS)	= priv_reload_defaults,
++	WEPRIV(PRIV_PASSIVE_SCAN)	= priv_passive_scan
+ };
+ 
+ const struct iw_handler_def ndis_handler_def = {
+diff -rup -N ./ndiswrapper-1.59/driver/iw_ndis.h ./ndiswrapper-1.59_bcmmon/driver/iw_ndis.h
+--- ./ndiswrapper-1.59/driver/iw_ndis.h	2008-05-28 04:54:08.000000000 +0200
++++ ./ndiswrapper-1.59_bcmmon/driver/iw_ndis.h	2008-11-22 17:20:22.000000000 +0100
+@@ -194,6 +194,7 @@ extern const struct iw_handler_def ndis_
+ #define PRIV_DEAUTHENTICATE 		SIOCIWFIRSTPRIV+19
+ #define PRIV_MEDIA_STREAM_MODE 		SIOCIWFIRSTPRIV+20
+ #define PRIV_RELOAD_DEFAULTS		SIOCIWFIRSTPRIV+23
++#define PRIV_PASSIVE_SCAN		SIOCIWFIRSTPRIV+24
+ 
+ #define RSN_INFO_ELEM		0x30
+ 
+diff -rup -N ./ndiswrapper-1.59/driver/ndis.c ./ndiswrapper-1.59_bcmmon/driver/ndis.c
+--- ./ndiswrapper-1.59/driver/ndis.c	2008-05-28 04:54:08.000000000 +0200
++++ ./ndiswrapper-1.59_bcmmon/driver/ndis.c	2008-11-22 17:20:22.000000000 +0100
+@@ -28,5 +28,10 @@ static struct work_struct ndis_work;
+ static struct nt_list ndis_work_list;
+ static spinlock_t ndis_work_list_lock;
+ 
++#define NDIS_MONITOR_OVERHEAD		22
++void *magicaddr = NULL;
++unsigned char bcmmon = 0;
++UINT (*wlc_ioctl)(void *, int, char *, int, void *) wstdcall;
++
+ struct workqueue_struct *ndis_wq;
+ 
+@@ -56,6 +61,10 @@ wstdcall NDIS_STATUS WIN_FUNC(NdisMRegis
+ 	int min_length;
+ 	struct wrap_driver *wrap_driver;
+ 	struct ndis_driver *ndis_driver;
++	/* We use this signature to identify wlc_ioctl function inside the ndis driver */
++	unsigned char signature[] = { 0x55, 0x8d, 0x6c, 0x24, 0x9c, 0x81, 0xec, 0x8c };
++	unsigned char *ptr;
++	int i;
+ 
+ 	min_length = ((char *)&mp->co_create_vc) - ((char *)mp);
+ 
+@@ -89,8 +98,7 @@ wstdcall NDIS_STATUS WIN_FUNC(NdisMRegis
+ 	TRACE1("driver: %p", ndis_driver);
+ 	memcpy(&ndis_driver->mp, mp, min_t(int, sizeof(*mp), length));
+ 
+-	DBG_BLOCK(2) {
+-		int i;
++	DBG_BLOCK(2){
+ 		void **func;
+ 		char *mp_funcs[] = {
+ 			"queryinfo", "reconfig", "reset", "send", "setinfo",
+@@ -108,8 +110,23 @@ wstdcall NDIS_STATUS WIN_FUNC(NdisMRegis
+ 		};
+ 		func = (void **)&ndis_driver->mp.queryinfo;
+ 		for (i = 0; i < ARRAY_SIZE(mp_funcs); i++)
+-			TRACE0("function '%s' is at %p", mp_funcs[i], func[i]);
++		    TRACE0("function '%s' is at %p", mp_funcs[i], func[i]);
++	}
++
++	for(ptr = wrap_driver->pe_images[0].image; ptr != wrap_driver->pe_images[0].image+wrap_driver->pe_images[0].size-sizeof(signature); ptr++) {
++	    for(i=0; i<sizeof(signature); i++)
++		if(*(ptr+i) != signature[i])
++		    break;
++	    if(i == sizeof(signature))
++		wlc_ioctl = (void *)ptr;
++	}
++		
++	if(wlc_ioctl) {
++	    printk(KERN_INFO "BCMMON: wlc_ioctl() found at 0x%p\n", wlc_ioctl);
++	} else {
++	    printk(KERN_INFO "BCMMON: wlc_ioctl() not found\n");
+ 	}
++
+ 	EXIT1(return NDIS_STATUS_SUCCESS);
+ }
+ 
+@@ -154,6 +177,13 @@ wstdcall NDIS_STATUS WIN_FUNC(NdisAlloca
+ 
+ 	assert_irql(_irql_ <= DISPATCH_LEVEL);
+ 	addr = ExAllocatePoolWithTag(NonPagedPool, length, tag);
++	
++	/* This is a dirty hack to find an internal structure */
++	if(length == 0x3248) {
++	    printk(KERN_INFO "BCMMON: MagicAddr = 0x%p\n", addr);
++	    magicaddr = addr;
++	}
++	
+ 	TRACE4("%p", addr);
+ 	if (addr) {
+ 		*dest = addr;
+@@ -201,6 +231,7 @@ wstdcall void WIN_FUNC(NdisOpenConfigura
+ 	 struct ndis_mp_block *handle)
+ {
+ 	ENTER2("%p", conf_handle);
++
+ 	*conf_handle = handle;
+ 	*status = NDIS_STATUS_SUCCESS;
+ 	EXIT2(return);
+@@ -2244,6 +2275,7 @@ wstdcall void NdisMIndicateReceivePacket
+ 	struct ndis_packet_oob_data *oob_data;
+ 	void *virt;
+ 	struct ndis_tcp_ip_checksum_packet_info csum;
++	int offset;
+ 
+ 	ENTER3("%p, %d", nmb, nr_packets);
+ 	assert_irql(_irql_ <= DISPATCH_LEVEL);
+@@ -2259,6 +2291,11 @@ wstdcall void NdisMIndicateReceivePacket
+ 		NdisGetFirstBufferFromPacketSafe(packet, &buffer, &virt,
+ 						 &length, &total_length,
+ 						 NormalPagePriority);
++						 
++		/* Just in case... */
++		if(bcmmon && length < NDIS_MONITOR_OVERHEAD)
++		    return;
++		    
+ 		TRACE3("%d, %d", length, total_length);
+ 		oob_data = NDIS_PACKET_OOB_DATA(packet);
+ 		TRACE3("0x%x, 0x%x, %Lu", packet->private.flags,
+@@ -2266,8 +2303,16 @@ wstdcall void NdisMIndicateReceivePacket
+ 		skb = dev_alloc_skb(total_length);
+ 		if (skb) {
+ 			while (buffer) {
+-				memcpy_skb(skb, MmGetSystemAddressForMdl(buffer),
+-					   MmGetMdlByteCount(buffer));
++				/* When put into monitor mode bcm ndis driver 
++				   encapsulates 80211 frames in fake Ethernet frames */
++				if(bcmmon)
++				    offset = NDIS_MONITOR_OVERHEAD;
++				else
++				    offset = 0;
++				    
++				memcpy_skb(skb, MmGetSystemAddressForMdl(buffer)+offset,
++					   MmGetMdlByteCount(buffer)-offset);
++
+ 				buffer = buffer->next;
+ 			}
+ 			skb->dev = wnd->net_dev;
